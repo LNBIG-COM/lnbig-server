@@ -1,0 +1,5 @@
+gRPC делает reconnect автоматически, с 20 сек. таймаутом для попытки
+Подробнее:
+
+https://github.com/grpc/grpc/issues/11611
+https://github.com/grpc/grpc/issues/11411#issuecomment-308899967

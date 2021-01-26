@@ -1,0 +1,4 @@
+create database `lnbig-test` character set 'utf8';
+GRANT ALL ON `lnbig-test`.* TO 'lnbig-test'@'localhost' IDENTIFIED BY '___PASSWORD___';
+use `lnbig-test`;
+
