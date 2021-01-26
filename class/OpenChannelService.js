@@ -9,59 +9,23 @@ const storage = require('node-persist');
 const walletBalance = require('../lib/walletBalance')
 const pendingChannels = require('../lib/pendingChannels')
 const listChannels = require('../lib/listChannels')
-const { newCapacity, pendingNodes } = require('../lib/utilChannels')
+const { newCapacity, checkPendingNodes } = require('../lib/utilChannels')
+const APIDataCache = require('../class/APIDataCache')
 
 const clientWebSockets = require('../global/clientWebSockets')
 const uuidv4 = require('uuid/v4')
 const nodeStorage = require('../global/nodeStorage')
 var _ = require('lodash')
 const pTimeout = require('p-timeout')
-const OPEN_CHANNEL_TIMEOUT = 5000
 
-const { FREE_OPEN_CHANNEL_LOCK_TTL, OPEN_CHANNEL_LOCK_EXPIRES, RESERVE_OPEN_CHANNEL_SATOSHIES } = require('../conf/commonConst')
+const OPEN_CHANNEL_TIMEOUT  = 5000
+const MAX_CHANNEL_VALUE     = 2 ** 24 - 1
+const BALANCE_VALUE_LOCK    = MAX_CHANNEL_VALUE
+const GRATIS_VALUE          = 2000000
+const VALUE_QUANTUM         = 1000
 
-class APIDataCache {
-    constructor(name, funcData, expires, storage) {
-        this.name = name
-        this.funcData = funcData
-        this.expires = expires
-        this.storage = storage
-        this.lastPromise = null
-        this.load = false
-    }
-
-    async data() {
-        let res
-        if (! ( res = await this.storage.getItem(this.name)) ) {
-            debug("APIDataCache: %s отсутствует в кеше", this.name)
-            // Нет - значит кеш истёк - тогда кто первый - тот и вытягивает, а остальные получают старый результат
-            if (! this.lastPromise || ! this.load) {
-                debug("APIDataCache: загружаем данные %s", this.name)
-                this.load = true
-                this.lastPromise = ( async () => {
-                    // TODO Добавить блок обработки исключений и отправлять ошибку на клиент, если какие либо проблемы
-                    try {
-                        res = await this.funcData()
-                        debug("APIDataCache: данные загружены (%s) - сохраняем в кеше", this.name)
-                        await this.storage.setItem(this.name, res, {ttl: this.expires})
-                    }
-                    finally {
-                        this.load = false
-                    }
-                    return res
-                })()
-            }
-            // Если уже данные загружаются - работаем со старой версией, если она есть, конечно
-            debug("APIDataCache: ожидаем исполнения %s", this.name)
-            res = await this.lastPromise
-        }
-        else {
-            debug("APIDataCache: данные (%s) в кеше - выдаём их", this.name)
-        }
-        return res
-    }
-}
-
+const { OPEN_CHANNEL_LOCK_TTL, OPEN_CHANNEL_LOCK_EXPIRES, RESERVE_OPEN_CHANNEL_SATOSHIES } = require('../conf/commonConst')
+const OPEN_CHANNEL_LOCK_KEY = 'openChannelLocks'
 
 class WalletBalanceCache extends APIDataCache {
     constructor(storage) {
@@ -83,7 +47,7 @@ class ListChannelsCache extends APIDataCache {
 
 class PendingNodesCache extends APIDataCache {
     constructor(storage, pcCache) {
-        super('pendingNodes', async () => pendingNodes(await pcCache.data()), 5 * 60 * 1000, storage )
+        super('pendingNodes', async () => checkPendingNodes(await pcCache.data()).pendingBalancesByNodeId, 5 * 60 * 1000, storage )
     }
 }
 
@@ -108,7 +72,29 @@ class OpenChannelService {
         return this.storagePromise
     }
 
-    async findFreeBalanceAndLock(valueSatoshies) {
+    async createOpenChannelRequest() {
+        let ocb = await this.storage.getItem(OPEN_CHANNEL_LOCK_KEY) || { byUUID: {}, byNodes: {}};
+        debug("createOpenChannelRequest: openChannelLocks до: %o", ocb)
+
+        // Формирует уникальный UUID, но балансы нод пока не опрашивает
+        let uuid = uuidv4();
+
+        // Сама локировка
+        let lock = {
+            uuid,
+            created: Date.now(),
+            redeemed: false,
+            pending: false
+        };
+
+        ocb.byUUID[uuid] = lock;
+
+        debug("createOpenChannelRequest: openChannelLocks после: %o", ocb)
+        await this.storage.setItem(OPEN_CHANNEL_LOCK_KEY, ocb);
+        return lock
+    }
+
+    async findFreeBalanceForLock(uuidLock, cb) {
         // Лезет в хранилище или переопрашивает снова ноды, имеет также хранилище локировок
         //  возвращает объект локировки, если блокировка была успешна
         let wb, lock = null, changed = false
@@ -119,101 +105,105 @@ class OpenChannelService {
         }
 
         wb = await this.wbCache.data()
-        debug("findFreeBalanceAndLock: имеем wb - из кеша или расчитанный, wb: %o", wb)
+        debug("findFreeBalanceForLock: имеем wb - из кеша или расчитанный, wb: %o", wb)
 
-        let ocb = await this.storage.getItem('openChannelLocks') || { byUUID: {}, byNodes: {}};
-        debug("findFreeBalanceAndLock: openChannelLocks до: %o", ocb)
+        let ocb = await this.storage.getItem(OPEN_CHANNEL_LOCK_KEY) || { byUUID: {}, byNodes: {}}
+        debug("findFreeBalanceForLock: openChannelLocks до: %o", ocb)
+
+        // Сначала удаляем истекщие блокировки, которые привязаны к заблокированным балансам
         for (let key of _.shuffle(_.keys(wb))) {
-            let uuid
-
             ocb.byNodes[key] = _.defaultTo(ocb.byNodes[key], { key, locks: [], amountLocks: 0 })
             // Проверяем другие блокировки на истёкший срок
             _.remove(ocb.byNodes[key].locks, uuid => {
                 let lock = ocb.byUUID[uuid]
                 if (Date.now() - lock.created >= OPEN_CHANNEL_LOCK_EXPIRES || lock.redeemed) {
                     // Локировка истекла или использована - удаляем её
-                    ocb.byNodes[lock.key].amountLocks -= lock.valueSatoshies + RESERVE_OPEN_CHANNEL_SATOSHIES
+                    ocb.byNodes[lock.key].amountLocks -= BALANCE_VALUE_LOCK + RESERVE_OPEN_CHANNEL_SATOSHIES
                     delete ocb.byUUID[lock.uuid]
                     changed = true
                     return 1
                 }
                 return 0
             })
-            if (! lock && (wb[key].confirmed_balance - ocb.byNodes[key].amountLocks) >= valueSatoshies) {
-                let ginfo = await nodeStorage.nodes[key].client.getInfo({})
-                if (ginfo.synced_to_chain) {
-                    // Если нода работает (могла бы находится на обслуживании, но отвечать на API)
-                    // Здесь есть баланс - ставим блокировку, но из цикла не выходим, чтобы удалить истекшие блокировки
-                    // uuid здесь - длинное случайное число - именно оно и используется как k1 в LNURL
-                    // Если да - надо как то обрабатывать ситуации, когда сервер рестартует или рестартуем сокет
-                    uuid = uuidv4();
+        }
 
-                    // Сама локировка
-                    lock = {
-                        uuid,
-                        key,
-                        valueSatoshies,
-                        created: Date.now(),
-                        redeemed: false,
-                        pending: false
-                    };
+        // TODO - забыл, но вроде этот код дубликат выше-приведённого
+        for (let uuid in ocb.byUUID) {
+            let lock = ocb.byUUID[uuid]
+            if (Date.now() - lock.created >= OPEN_CHANNEL_LOCK_EXPIRES || lock.redeemed) {
+                // Локировка истекла или использована - удаляем её
+                delete ocb.byUUID[lock.uuid]
+                changed = true
+            }
+        }
 
-                    ocb.byUUID[uuid] = lock;
-                    ocb.byNodes[key].locks.push(uuid);
-                    ocb.byNodes[key].amountLocks += valueSatoshies + RESERVE_OPEN_CHANNEL_SATOSHIES
-                    changed = true
-                    debug("findFreeBalanceAndLock: нашли ноду с таким балансом, lock=%o", lock);
+        if ((lock = ocb.byUUID[uuidLock])) {
+            // Затем ищём свободные балансы
+            for (let key of _.shuffle(_.keys(wb))) {
+                if ((wb[key].confirmed_balance - ocb.byNodes[key].amountLocks) >= BALANCE_VALUE_LOCK + RESERVE_OPEN_CHANNEL_SATOSHIES) {
+                    let ginfo = await nodeStorage.nodes[key].client.getInfo({})
+                    if (ginfo.synced_to_chain) {
+                        // Если нода работает (могла бы находится на обслуживании, но отвечать на API)
+                        // Здесь есть баланс - ставим блокировку, но из цикла не выходим, чтобы удалить истекшие блокировки
+                        // uuid здесь - длинное случайное число - именно оно и используется как k1 в LNURL
+                        // Если да - надо как то обрабатывать ситуации, когда сервер рестартует или рестартуем сокет
+                        // Сама локировка
+                        lock.key = key
+                        ocb.byNodes[key].locks.push(uuidLock);
+                        ocb.byNodes[key].amountLocks += BALANCE_VALUE_LOCK + RESERVE_OPEN_CHANNEL_SATOSHIES
+                        changed = true
+                        debug("findFreeBalanceForLock: нашли ноду с таким балансом, lock=%o", lock);
+                        cb(null, lock)
+                        break
+                    }
                 }
             }
         }
+
         if (changed) {
-            debug("findFreeBalanceAndLock: openChannelLocks после: %o", ocb)
-            await this.storage.setItem('openChannelLocks', ocb);
+            debug("findFreeBalanceForLock: openChannelLocks после: %o", ocb)
+            await this.storage.setItem(OPEN_CHANNEL_LOCK_KEY, ocb);
         }
-        else {
-            debug("findFreeBalanceAndLock: нет в наличии нигде %d sat :(", valueSatoshies);
+
+        if (lock && typeof lock.key === 'undefined') {
+            debug("findFreeBalanceForLock: нет в наличии нигде %d sat :(", BALANCE_VALUE_LOCK)
+            cb({
+                status: 'ERROR',
+                reason: 'No free funds for open channel. Please repeat later!'
+            })
+
         }
-        return lock
+        else if (! lock){
+            debug("findFreeBalanceForLock: не нашли нужной блокировки %s", uuidLock)
+            cb({
+                status: 'ERROR',
+                reason: 'Your lock was redeemed or expired'
+            })
+        }
     }
 
     async getResponseOfBalanceLock(uuidLock) {
-        let ocb = await this.storage.getItem('openChannelLocks')
-        if (ocb && ocb.byUUID && ocb.byUUID[uuidLock]) {
-            let lock = ocb.byUUID[uuidLock]
-            debug("getLNURL: блокировка найдена (%s): %o", uuidLock, lock)
-            if (! lock.redeemed && (Date.now() - lock.created) < OPEN_CHANNEL_LOCK_EXPIRES) {
-                // Блокировка не истрачена и время не закончилось
-                debug("getLNURL: блокировка не истрачена и валидная: %o", lock)
-                lock.res = {
+        let res
+        await this.findFreeBalanceForLock(uuidLock, (err, lock) => {
+            if (err) {
+                res = err
+            }
+            else {
+                res = lock.res = {
                     uri: this.getNodeURI(lock.key),
                     callback: `${process.env.BASE_API_URL}/oc`,
                     k1: lock.uuid,
-                    capacity: lock.valueSatoshies,
-                    push: 0,
                     tag: "channelRequest"
                 }
-                debug("Клиенту выдан такой объект: %o", lock.res)
-                // Сохраняем все блокировки заново, так как для текущей мы сформировали и хотим сохранить response объект
-                await this.storage.setItem('openChannelLocks', ocb)
-                return lock.res
             }
-            else if (lock.redeemed) {
-                return {
-                    status: 'ERROR',
-                    reason: 'Your lock was redeemed'
-                }
-            }
-            else {
-                return {
-                    status: 'ERROR',
-                    reason: 'Your lock was expired'
-                }
-            }
-        }
+        })
+        if (res)
+            return res
         else {
+            console.error('getResponseOfBalanceLock: ошибка, которая не должна была возникнуть')
             return {
                 status: 'ERROR',
-                reason: 'LNURL is not valid already'
+                reason: "Unknown error! It's very strange :-/"
             }
         }
     }
@@ -223,15 +213,19 @@ class OpenChannelService {
     }
 
     // Эта функция вызывается для открытия канала по запросу клиента-кошелька, например BLW
+    /*
+    *
+    * TODO:
+    * если privateChannel === null, то надо самим вычислить - какой канал нужно открыть
+    * сумма канала должна вычисляться здесь самостоятельно
+    * */
     async openChannelByCallback(uuidLock, remoteID, privateChannel) {
         // Только на этом этапе мы знаем публичный ключ ноды remoteID, поэтому только здесь мы можем начать проверки
         // Проверить лимиты на ноду и либо открыть, либо кинуть исключение
         // Входные параметры должны быть проверены ранее и быть валидными
-        let ws
 
         // Проверяем лимит для данного remoteID
-        ws = this.wsClientByUUID(uuidLock)
-        ws && ws.sendCommand('setCurrentStageIndexByWS', { openChannelProgressIndex: 7 }, 'openChannel')
+        this.sendIndexToWebsocket(uuidLock, 7)
 
         let openedNode = await this.storage.getItem(`openedNode-${remoteID}`)
         if (openedNode) {
@@ -245,9 +239,7 @@ class OpenChannelService {
                     return 1
                 })
                 debug('Блокировка %s будет удалена, так как узел повторно открывает новый канал', uuidLock)
-                ws = this.wsClientByUUID(uuidLock)
-                ws && ws.sendCommand('setCurrentOpenChannelErrorByWS', { error: "You have recently opened a channel. Try in 15 minutes" }, 'openChannel')
-                return { status: "ERROR", reason: "You have recently opened a channel. Try in 15 minutes"}
+                return { status: "ERROR", reason: this.sendErrorToWebsocket(uuidLock,"You have recently opened a channel. Try in 15 minutes!")}
             }
             else {
                 debug('Проверку аннулируем, так как работаем не в production режиме')
@@ -269,9 +261,9 @@ class OpenChannelService {
             // Теперь открываем канал на нужной ноде
 
             /*
-            * Проверка на использование каналов, которые уже были открыты
-            * Если узел имеет каналы, которые можно ещё использовать, тогда не позволяем ему бесплатный сервис
-            * */
+             * Проверка на использование каналов, которые уже были открыты
+             * Если узел имеет каналы, которые можно ещё использовать, тогда не позволяем ему бесплатный сервис
+             * */
             let newCapacity = await this.calcNewCapacity(remoteID)
             if (newCapacity < 0) {
                 // Значит каналы на этот узел уже есть и там достаточно ёмкости - пусть получат сначала
@@ -284,7 +276,6 @@ class OpenChannelService {
                         return 1
                     })
                     debug('Блокировка %s будет удалена, так как узел открывает новый канал, не использовав существующие каналы', uuidLock)
-                    ws = this.wsClientByUUID(uuidLock)
                     let howMany = -newCapacity / 2 / 1000
                     if (howMany >= 1000) {
                         howMany = Math.round((howMany / 1000 + 0.1) * 10) / 10 + 'M sats'
@@ -292,18 +283,17 @@ class OpenChannelService {
                     else {
                         howMany = Math.round(howMany + 1) + 'K sats'
                     }
-
-                    ws && ws.sendCommand('setCurrentOpenChannelErrorByWS', {error: `First, please receive payments in the amount of ${howMany}, or open a channel to us for that amount!`}, 'openChannel')
-                    return { status: "ERROR", reason: `First, please receive payments in the amount of ${howMany}, or open a channel to us for that amount!`}
+                    return { status: "ERROR", reason: this.sendErrorToWebsocket(uuidLock, `First, please receive payments in the amount of ${howMany}, or open a channel to us for that amount!`)}
                 }
                 else {
                     debug('Проверку аннулируем, так как работаем не в production режиме')
+                    newCapacity = 1
                 }
             }
 
             let pn = await this.pnCache.data()
             if (pn[remoteID]) {
-                // Значит каналы на этот узел уже есть и там достаточно ёмкости - пусть получат сначала
+                // Узел имеет panding каналы - сначала нужно дождаться, когда они пропадут
                 debug("openChannelByCallback: попытка открытия канала с нодой (%s), которая имеет pending каналы с другими нашими нодами: %o", remoteID, pn[remoteID])
                 if (process.env.NODE_ENV === 'production') {
                     // Помечаем блокировку как истраченную, чтобы она сразу пометилась и баланс блокировки вернулся обратно
@@ -314,9 +304,7 @@ class OpenChannelService {
                     })
                     let ourNodes = Object.keys(pn[remoteID]).join(', ')
                     debug('Блокировка %s будет удалена, так как узел открывает новый канал, хотя имеет другие pending каналы с нами (%s)', uuidLock, ourNodes)
-                    ws = this.wsClientByUUID(uuidLock)
-                    ws && ws.sendCommand('setCurrentOpenChannelErrorByWS', { error: `You have pending channels with us (our nodes: ${ourNodes}). Wait until the channels will be opened and try again!` }, 'openChannel')
-                    return { status: "ERROR", reason: `You have pending channels with us (our nodes: ${ourNodes}). Wait until the channels will be opened and try again!`}
+                    return { status: "ERROR", reason: this.sendErrorToWebsocket(uuidLock, `You have pending channels with us (our nodes: ${ourNodes}). Wait until the channels will be opened and try again!`)}
                 }
                 else {
                     debug('Проверку аннулируем, так как работаем не в production режиме')
@@ -325,18 +313,25 @@ class OpenChannelService {
 
             if (nodeStorage.nodes[lock.key].client) {
                 // Значит нода работает - посылаем ей команду
-                ws = this.wsClientByUUID(uuidLock)
-                ws && ws.sendCommand('setCurrentStageIndexByWS', { openChannelProgressIndex: 8 }, 'openChannel')
-                let getinfo = await nodeStorage.nodes[lock.key].client.getInfo({})
+                // Мы здесь - значит newCapacity > 0
+                this.sendIndexToWebsocket(uuidLock, 8)
+                let fundingAmount = Math.min(Math.ceil((newCapacity + GRATIS_VALUE) / VALUE_QUANTUM), MAX_CHANNEL_VALUE)
+                let getinfo
+                try {
+                    getinfo = await nodeStorage.nodes[lock.key].client.getInfo({})
+                }
+                catch (e) {
+                    getinfo.synced_to_chain = false
+                }
                 if (! getinfo.synced_to_chain) {
-                    return {status: 'ERROR', reason: 'Sorry but our node is being maintenanced now. Please try few later!'}
+                    return {status: 'ERROR', reason: this.sendErrorToWebsocket(uuidLock, 'Sorry but our node is being maintenanced now. Please try few later!')}
                 }
                 let res
                 try {
                     res = await pTimeout(
                         nodeStorage.nodes[lock.key].client.openChannelSync({
-                            node_pubkey_string: remoteID,
-                            local_funding_amount: lock.valueSatoshies,
+                            node_pubkey: Buffer.from(remoteID, 'hex'),
+                            local_funding_amount: fundingAmount,
                             push_sat: 0,
                             target_conf: 12,
                             private: privateChannel,
@@ -346,21 +341,21 @@ class OpenChannelService {
                         }),
                         OPEN_CHANNEL_TIMEOUT
                     )
-                    console.log('Открыт канал из confirmed средств: %o', res)
+                    debug('Открыт канал из confirmed средств: %o', res)
                 }
                 catch(e) {
-                    console.log('Открытие канала из confirmed не сработало, пробуем unconfirmed, error: %s', e.message)
+                    debug('Открытие канала из confirmed не сработало, пробуем unconfirmed, error: %s', e.message)
 
                     if (Date.now() - lock.created >= OPEN_CHANNEL_LOCK_EXPIRES) {
                         //  Если блокировка истекла - ничего не делаем
-                        return {status: 'ERROR', reason: 'Long opening channel - your lock was expired. Please try again!'}
+                        return {status: 'ERROR', reason: this.sendErrorToWebsocket(uuidLock, 'Long opening channel - your lock was expired. Please try again!')}
                     }
 
                     try {
                         res = await pTimeout(
                             nodeStorage.nodes[lock.key].client.openChannelSync({
-                                node_pubkey_string: remoteID,
-                                local_funding_amount: lock.valueSatoshies,
+                                node_pubkey: Buffer.from(remoteID, 'hex'),
+                                local_funding_amount: fundingAmount,
                                 push_sat: 0,
                                 target_conf: 6,
                                 private: privateChannel,
@@ -370,11 +365,11 @@ class OpenChannelService {
                             }),
                             OPEN_CHANNEL_TIMEOUT
                         )
-                        console.log('Открыт канал из unconfirmed средств: %o', res)
+                        debug('Открыт канал из unconfirmed средств: %o', res)
                     }
                     catch(e) {
-                        console.log('Открытие канала из unconfirmed не сработало - отказываем, error: %s', e.message)
-                        return {status: 'ERROR', reason: 'We cannot open channel. Did your node connect to us?'}
+                        debug('Открытие канала из unconfirmed не сработало - отказываем, error: %s', e.message)
+                        return {status: 'ERROR', reason: this.sendErrorToWebsocket(uuidLock, 'We cannot open channel. Did your node connect to us?')}
                     }
                 }
                 debug("res от openChannelSync: %o", res)
@@ -390,36 +385,55 @@ class OpenChannelService {
                     openedNode = {
                         remoteID,
                         openedTime: Date.now(),
-                        valueSatoshies: lock.valueSatoshies,
+                        valueSatoshies: fundingAmount,
+                        newCapacity,
                         privateChannel,
                         uuidLock,
                     }
                     // Сохраняем блокировку
-                    await this.storage.setItem(`openedNode-${remoteID}`, openedNode, { ttl: FREE_OPEN_CHANNEL_LOCK_TTL })
+                    await this.storage.setItem(`openedNode-${remoteID}`, openedNode, { ttl: OPEN_CHANNEL_LOCK_TTL })
                     debug("Сохранили эту ноду (%s) в списке воспользовавшихся нод: %o", remoteID, openedNode)
 
                     debug('p_3, lock: %o', lock)
-                    ws = this.wsClientByUUID(uuidLock)
-                    ws && ws.sendCommand('setCurrentStageIndexByWS', { openChannelProgressIndex: 9 }, 'openChannel')
+                    this.sendIndexToWebsocket(uuidLock, 9)
                     debug("Послана команда updateChannelPolicy, она не возвращает результат")
                     return {status: "OK"}
                 }
             }
             else {
-                return {status: 'ERROR', reason: 'Sorry but our node is being maintenanced now. Please try few later!'}
+                await this.changeLock(uuidLock,(lock) => {
+                    lock.pending = false
+                    return 1
+                })
+                return {status: 'ERROR', reason: this.sendErrorToWebsocket(uuidLock, 'Sorry but our node is being maintenanced now. Please try few later!')}
             }
         }
         else {
-            return {status: 'ERROR', reason: typeof lock === 'undefined' ? 'LNURL is not valid already' : 'Your lock was redeemed or expired'}
+            await this.changeLock(uuidLock,(lock) => {
+                lock.pending = false
+                return 1
+            })
+            return {status: 'ERROR', reason: this.sendErrorToWebsocket(uuidLock, typeof lock === 'undefined' ? 'LNURL is not valid already' : 'Your lock was redeemed or expired')}
         }
     }
 
+    sendErrorToWebsocket(uuidLock, text) {
+        let ws = this.wsClientByUUID(uuidLock)
+        ws && ws.sendCommand('setCurrentOpenChannelErrorByWS', { error: text }, 'openChannel')
+        return text
+    }
+
+    sendIndexToWebsocket(uuidLock, index) {
+        let ws = this.wsClientByUUID(uuidLock)
+        ws && ws.sendCommand('setCurrentStageIndexByWS', { openChannelProgressIndex: index }, 'openChannel')
+    }
+
     async changeLock(uuidLock, cb) {
-        let ocb = await this.storage.getItem('openChannelLocks')
+        let ocb = await this.storage.getItem(OPEN_CHANNEL_LOCK_KEY)
         let lock
         if (ocb && ocb.byUUID && (lock = ocb.byUUID[uuidLock])) {
             if (cb(lock)) {
-                await this.storage.setItem('openChannelLocks', ocb)
+                await this.storage.setItem(OPEN_CHANNEL_LOCK_KEY, ocb)
                 return lock
             }
             return null

@@ -20,7 +20,7 @@ const {splitChannelPoint} = require('../lib/utilChannels')
 
 var PromisePool = require('es6-promise-pool')
 
-const FOREIGN_DELTA_CLTV = 40
+const FOREIGN_DELTA_CLTV = 144
 
 // Нижняя и верхние границы local_balance части, в пределах которых мы считаем баланс сбалансированным
 
@@ -40,26 +40,26 @@ const FEE_DENOMINATOR = 1000000
 
 // Целевое значение fee %, к которому мы стремимся
 // РЕДАКТИРОВАТЬ ЭТОТ ПАРАМЕТР, если что
-const TARGET_FEE_MARKET = 7000
+const TARGET_FEE_MARKET = 500
 
 // Комиссия между нашими узлами
-const TARGET_FEE_OUR_NODE = 0
+const TARGET_FEE_OUR_NODE = 1
 
 // Целевое значение, которого мы стремимся придерживаться для нормальных каналов.
 // Здесь учтена поправка, если платёж прошёл хотя бы через один канал между нашими нодами
 const TARGET_FEE_BALANCED = TARGET_FEE_MARKET
 
 // Для каналов, которые истощились - высокая комиссия
-//const TARGET_FEE_STOP = Math.round(TARGET_FEE_MARKET * 2)
-const TARGET_FEE_STOP = Math.round(TARGET_FEE_MARKET * 1)
+const TARGET_FEE_STOP = Math.round(TARGET_FEE_MARKET * 2)
+//const TARGET_FEE_STOP = Math.round(TARGET_FEE_MARKET * 1)
 
 // Для каналов, которые хотим сбалансировать
-//const TARGET_FEE_CHEAP = Math.round(TARGET_FEE_MARKET * 0.5)
-const TARGET_FEE_CHEAP = Math.round(TARGET_FEE_MARKET * 1)
+const TARGET_FEE_CHEAP = Math.round(TARGET_FEE_MARKET * 0.5)
+//const TARGET_FEE_CHEAP = Math.round(TARGET_FEE_MARKET * 1)
 
 // Комиссия для частных каналов
-//const TARGET_FEE_PRIVATE =  Math.round(TARGET_FEE_MARKET * 3)
-const TARGET_FEE_PRIVATE =  Math.round(TARGET_FEE_MARKET * 1)
+const TARGET_FEE_PRIVATE =  Math.round(TARGET_FEE_MARKET * 3)
+//const TARGET_FEE_PRIVATE =  Math.round(TARGET_FEE_MARKET * 1)
 
 // Каналы между моими нодами
 const LOCAL_DELTA_CLTV   = 18

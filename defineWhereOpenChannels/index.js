@@ -14,7 +14,7 @@ var PromisePool = require('es6-promise-pool')
 
 const CHANNEL_CAPACITY = 2000000;
 
-process.umask(077);
+process.umask(0o77);
 
 const nodeStorage = require('../global/nodeStorage');
 

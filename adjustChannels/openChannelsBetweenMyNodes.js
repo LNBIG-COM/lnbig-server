@@ -60,7 +60,7 @@ async function main(password) {
     debug("Мои ноды: %o", myNodes)
 
     // To connect to nodes
-    await nodeStorage.connect();
+    await nodeStorage.connect({longsAsNumbers: false});
 
     debug('Запускаются асинхронные команды listChannels...')
 
@@ -95,7 +95,7 @@ function* openChannelPromise() {
                 if (nodeStorage.nodes[key2].client) {
                     // И вот здесь корфмируем список
                     if (   key1 !== key2
-                        && (!myInternalChannels[key1] || !myInternalChannels[key1][key2] || myInternalChannels[key1][key2] < 10000000)
+                        && (!myInternalChannels[key1] || !myInternalChannels[key1][key2] || myInternalChannels[key1][key2] < 8000000)
                     ){
                         // Канала нет - создаём
                         openChannelData.push({
@@ -167,7 +167,7 @@ function findChannelsToMyNodes(key, listChannels, pendingChannels) {
         if (myNodes[channel.remote_pubkey]) {
             // Значит канал с моей ноды - заносим данные
             myInternalChannels[key] = myInternalChannels[key] || {}
-            myInternalChannels[key][myNodes[channel.remote_pubkey]] = Math.max(myInternalChannels[key][myNodes[channel.remote_pubkey]] || 0, channel.local_balance)
+            myInternalChannels[key][myNodes[channel.remote_pubkey]] = Math.max(myInternalChannels[key][myNodes[channel.remote_pubkey]] || 0, +channel.local_balance)
         }
     }
 
@@ -175,7 +175,7 @@ function findChannelsToMyNodes(key, listChannels, pendingChannels) {
         if (myNodes[channel.channel.remote_node_pub]) {
             // Значит канал с моей ноды - заносим данные
             myInternalChannels[key] = myInternalChannels[key] || {}
-            myInternalChannels[key][myNodes[channel.channel.remote_node_pub]] = Math.max(myInternalChannels[key][myNodes[channel.channel.remote_node_pub]] || 0, channel.channel.local_balance)
+            myInternalChannels[key][myNodes[channel.channel.remote_node_pub]] = Math.max(myInternalChannels[key][myNodes[channel.channel.remote_node_pub]] || 0, +channel.channel.local_balance)
         }
     }
 }
@@ -202,6 +202,7 @@ async function openChannelWithNode(pubKey, whereOpen, address, amnt = CHANNEL_CA
         if (connected) {
             try {
                 let res = await pTimeout(
+                    // TODO изменить node_pubkey_string здесь и везде на node_pubkey (Buffer.from(pukey, 'hex'))
                     myNode.client.openChannelSync({
                         node_pubkey_string: pubKey,
                         local_funding_amount: amnt,
@@ -215,11 +216,11 @@ async function openChannelWithNode(pubKey, whereOpen, address, amnt = CHANNEL_CA
                     }),
                     OPEN_CHANNEL_TIMEOUT
                 )
-                debug("openChannelWithNode(%s): результат открытия канала: %o", pubKey, res)
+                console.log("openChannelWithNode(%s): результат открытия канала: %o", pubKey, res)
                 return res;
             }
             catch (e) {
-                debug("openChannelWithNode(%s): ошибка (%s) открытия канала (коннект есть), возможно кончились средства (%s)", pubKey, e.message, whereOpen)
+                console.error("openChannelWithNode(%s): ошибка (%s) открытия канала (коннект есть), возможно кончились средства (%s)", pubKey, e.message, whereOpen)
                 return null
             }
         }

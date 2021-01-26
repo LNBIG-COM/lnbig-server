@@ -35,7 +35,7 @@ module.exports = class CaptchaCommands extends Commands {
             debug("cmdRecaptchaV3: response=%o", response)
             debug("cmdRecaptchaV3: score=%d", response.data.score)
             debug("captchaName: %o, %s", this.captchaName, this.captchaName)
-            this.reCaptchaV3 = res.result = process.env.NODE_ENV === 'development' ? false : (response.data.success && response.data.action == this.captchaName && response.data.score >= 0.5)
+            this.reCaptchaV3 = res.result = (response.data.success && response.data.action == this.captchaName && response.data.score >= 0.5)
         }
         catch (e) {
             if (e.response) {

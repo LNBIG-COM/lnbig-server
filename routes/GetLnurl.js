@@ -1,8 +1,3 @@
-/*
- * Copyright (c) 2019 LNBIG.com
- * All rights reserved.
- */
-
 const openChannelService = require('../global/openChannelService');
 const debug = require('debug')('lnbig:routes:lnurl')
 

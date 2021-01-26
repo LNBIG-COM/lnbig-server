@@ -6,8 +6,12 @@ require('dotenv').config()
 let program = require('commander')
 let _ = require('lodash');
 const pTimeout = require('p-timeout')
-const {pendingNodes, currentBlockchainBlock} = require('../lib/utilChannels')
+const {checkPendingNodes, currentBlockchainBlock, splitChannelPoint} = require('../lib/utilChannels')
 const grpc = require('grpc')
+
+const MAX_CHAN_VALUE = 2**24 - 1
+const DEFAULT_THRESHOLD_FOR_OPEN_CHANNEL    = 15E6 // The default threshold in sats if remote side has this minimum balance more
+const DEFAULT_MINIMUM_VALUE_OPENED_CHANNEL  = 16E6 // The minimum in sats for auto-openning channel
 
 var Lock  = require('file-lock');
 const LOCK_FILE = '/run/lock/open-close-channels.pid'
@@ -24,8 +28,6 @@ let getInfo = require('../lib/getInfo')
 var PromisePool = require('es6-promise-pool')
 let Long = require('long')
 
-const MAX_CHAN_VALUE = 2**24 - 1
-const MIN_SATOSHI_SENT = 100000
 
 process.umask(0o77);
 
@@ -36,7 +38,9 @@ const debug = require('debug')('lnbig:dwoc')
 let
     myNodes = {},
     statNodes = {},
-    pendingChannelByNodeID,
+    pendingBalancesByNodeId,
+    badPendingChannels,
+    waitClosePendingChannels,
     nodeAddresses = {},
     connectionNodes = {}    // Для нод, которые не имеют публичного IP или Tor - сюда заносим наши сервера, где есть с ними коннект
 
@@ -52,8 +56,8 @@ program
 
 program
     .command('open')
-    .option('-t, --threshold <n>', 'Проходная величина для открытия канала', (str, def) => parseInt(str || def), 6000000)
-    .option('-m, --minimal-channel <n>', 'Минимальная величина открываемого канала', (str, def) => parseInt(str || def), 3000000)
+    .option('-t, --threshold <n>', 'Проходная величина для открытия канала', (str, def) => parseInt(str || def, 10), DEFAULT_THRESHOLD_FOR_OPEN_CHANNEL)
+    .option('-m, --minimal-channel <n>', 'Минимальная величина открываемого канала', (str, def) => parseInt(str || def, 10), DEFAULT_MINIMUM_VALUE_OPENED_CHANNEL)
     .option('-n, --dry-run', 'Проверочный запуск без действий для открытия каналов')
     .action((opts) => {
         command = 'open'
@@ -63,13 +67,23 @@ program
 
 program
     .command('close')
-    .option('-t, --threshold <n>', 'Величина threshold, которая используется для открытия каналов', (str, def) => parseInt(str || def), 6000000)
+    .option('-t, --threshold <n>', 'Величина threshold, которая используется для открытия каналов', (str, def) => parseInt(str || def, 10), DEFAULT_THRESHOLD_FOR_OPEN_CHANNEL)
     .option('-n, --dry-run', 'Проверочный запуск без действий')
     .option('-f, --forced', 'Закрывать каналы, которые можно закрыть как forced (только не активные каналы в данный момент)')
-    .option('-o, --older-days <n>', 'Скольки старее дней должны быть каналы', (str, def) => parseInt(str || def), 60)
+    .option('-o, --older-days <n>', 'Скольки старее дней должны быть каналы', (str, def) => parseInt(str || def, 10), 60)
     .option('-m, --max-btc <n>', 'Скольки максимум освободить BTC', parseFloat)
     .action((opts) => {
         command = 'close'
+        options = opts
+        main()
+    })
+
+program
+    .command('close-bad')
+    .option('-n, --dry-run', 'Проверочный запуск без действий')
+    .option('-w, --wait-close', 'Закрыть нормальные каналы, но в статусе "wait close pending"')
+    .action((opts) => {
+        command = 'close-bad'
         options = opts
         main()
     })
@@ -139,6 +153,7 @@ async function _main(password) {
     debug('Запускаются асинхронные команды listChannels...')
 
     $listChannels = listChannels(nodeStorage, command === 'close' ? (options.forced ? { inactive_only: true } : { active_only: true }) : undefined)
+    //$listChannels = listChannels(nodeStorage)
     $listPeers = listPeers(nodeStorage)
     $pendingChannels = pendingChannels(nodeStorage)
     $describeGraph = describeGraph(nodeStorage)
@@ -167,7 +182,7 @@ async function _main(password) {
     }
 
     currentBlock = currentBlockchainBlock($getInfo)
-    pendingChannelByNodeID = pendingNodes($pendingChannels)
+    ;({pendingBalancesByNodeId, badPendingChannels, waitClosePendingChannels} = await checkPendingNodes($pendingChannels))
 
     await openNewChannels()
 }
@@ -177,136 +192,146 @@ function* commandChannelPromise() {
     let channelCommands = []
     let willBeFree = 0, maxBTC = options.maxBtc
 
-    for (let key in $listChannels) {
-        for (let channel of $listChannels[key].channels) {
-            if (! myNodes.hasOwnProperty(channel.remote_pubkey))
-            {
-                // Внешняя нода и в неё было отправлено какое-то количество сатоши
-                debug("Анализируем канал: %s, %o", key, channel)
-                let item = statNodes[channel.remote_pubkey] = statNodes[channel.remote_pubkey]
-                    ||
-                    {
-                        newCapacity:           0,
-                        amountChannels:        0,
-                        amountPrivateChannels: 0,
-                        notActive:             0,
-                        isPendingHTLC:         false       ,  // Если есть хотя бы один зависший HTLC - не будем создавать канал
-                        pubKey:                channel.remote_pubkey,
-                        myNodes:               {},
-                        pending:               pendingChannelByNodeID[channel.remote_pubkey] ? Object.keys(pendingChannelByNodeID[channel.remote_pubkey]).length : 0,
-                        closeChallengers:      [],
-                    };
+    if (command === 'close-bad') {
+        (options.waitClose ? waitClosePendingChannels : badPendingChannels).reduce((acc, val) => {
+            acc.push({
+                command: 'closeBadChannel',
+                ...val,
+            })
+            return acc
+        }, channelCommands)
+    }
+    else {
+        for (let key in $listChannels) {
+            for (let channel of $listChannels[key].channels) {
+                if (! myNodes.hasOwnProperty(channel.remote_pubkey))
+                {
+                    // Внешняя нода и в неё было отправлено какое-то количество сатоши
+                    // debug("Анализируем канал: %s, %o", key, channel)
+                    let item = statNodes[channel.remote_pubkey] = statNodes[channel.remote_pubkey]
+                        ||
+                        {
+                            newCapacity:           0,
+                            amountChannels:        0,
+                            amountPrivateChannels: 0,
+                            notActive:             0,
+                            isPendingHTLC:         false       ,  // Если есть хотя бы один зависший HTLC - не будем создавать канал
+                            pubKey:                channel.remote_pubkey,
+                            myNodes:               {},
+                            pending:               pendingBalancesByNodeId[channel.remote_pubkey] ? Object.keys(pendingBalancesByNodeId[channel.remote_pubkey]).length : 0,
+                            closeChallengers:      [],
+                        };
 
-                if (channel.private)
-                    item.amountPrivateChannels++
+                    if (channel.private)
+                        item.amountPrivateChannels++
 
-                let blockHeight = Long.fromString(channel.chan_id, true).shru(40).toNumber()
-                item.isPendingHTLC = item.isPendingHTLC || !!+ channel.pending_htlcs.length
+                    let blockHeight = Long.fromString(channel.chan_id, true).shru(40).toNumber()
+                    item.isPendingHTLC = item.isPendingHTLC || !!+ channel.pending_htlcs.length
 
-                if (! channel.active)
-                    item.notActive++
+                    if (! channel.active)
+                        item.notActive++
 
-                item.amountChannels++
+                    item.amountChannels++
 
-                // Здесь сразу умножаю на два, чтобы потом не делать
-                item.newCapacity += (+channel.capacity / 2 - +channel.local_balance) * 2
+                    // Здесь сразу умножаю на два, чтобы потом не делать
+                    item.newCapacity += (+channel.capacity / 2 - +channel.local_balance) * 2
 
-                if (! channel.pending_htlcs.length
-                    && channel.initiator
-                    && channel.remote_balance == 0
-                    && (currentBlock - blockHeight) >= options.olderDays * 144
-                ) {
-                    debug('Претендет-канал на закрытие: %o', channel)
-                    item.closeChallengers.push({channel, key})
+                    if (! channel.pending_htlcs.length
+                        && channel.initiator
+                        && channel.remote_balance == 0
+                        && (currentBlock - blockHeight) >= options.olderDays * 144
+                    ) {
+                        // debug('Претендет-канал на закрытие: %o', channel)
+                        item.closeChallengers.push({channel, key})
+                    }
+
+                    //debug("newCapacity текущее: %d (key: %s, %o)", item.newCapacity, key, channel)
+                    //debug("Для канала получили данные: %o", item)
                 }
-
-                debug("newCapacity текущее: %d (key: %s, %o)", item.newCapacity, key, channel)
-                debug("Для канала получили данные: %o", item)
             }
         }
-    }
 
-    for (let pubKey of _.shuffle(Object.keys(statNodes))) {
-        let item = statNodes[pubKey]
+        for (let pubKey of _.shuffle(Object.keys(statNodes))) {
+            let item = statNodes[pubKey]
 
-        debug("Данные узла: %o", item)
-        // Сначала определяем тип ноды и отвечаем на вопрос: надо ли нам создавать там канал
-        let toOpenChannel  = false
-        let toCloseChannel = false
+            debug("Данные узла: %o", item)
+            // Сначала определяем тип ноды и отвечаем на вопрос: надо ли нам создавать там канал
+            let toOpenChannel  = false
+            let toCloseChannel = false
 
-        // TODO Сделать потом учёт - какие ноды закрывают каналы вскоре, как мы откроем на них канал - есть ноды, которые кооперативно или нет закрывают каналы
-        // например - это могут быть Tor ноды, которые не хотят получать платежи. В таких случаях надо переставать открывать на них каналы (список не желающих)
-        toOpenChannel = item.newCapacity >= options.threshold && item.pending === 0 && item.notActive === 0 && ! item.amountPrivateChannels
-        item.closeChallengers = item.closeChallengers.sort((a, b) => +b.channel.capacity - +a.channel.capacity)
-        toCloseChannel = item.closeChallengers.length
-            ?
-            item.newCapacity + +item.closeChallengers[0].channel.capacity < options.threshold
-            :
-            false
+            // TODO Сделать потом учёт - какие ноды закрывают каналы вскоре, как мы откроем на них канал - есть ноды, которые кооперативно или нет закрывают каналы
+            // например - это могут быть Tor ноды, которые не хотят получать платежи. В таких случаях надо переставать открывать на них каналы (список не желающих)
+            toOpenChannel = item.newCapacity >= options.threshold && item.pending === 0 && item.notActive === 0 && ! item.amountPrivateChannels
+            item.closeChallengers = item.closeChallengers.sort((a, b) => +b.channel.capacity - +a.channel.capacity)
+            toCloseChannel = item.closeChallengers.length
+                ?
+                item.newCapacity + +item.closeChallengers[0].channel.capacity < options.threshold
+                :
+                false
 
-        if (command === 'open' && toOpenChannel) {
-            let minimalAmnt = Math.round(item.newCapacity < options.minimalChannel ? options.minimalChannel : item.newCapacity)
-            let data
-            if (nodeAddresses[pubKey]) {
-                // У неё есть IP address
-                let where = Object.keys(nodeStorage.nodes).filter(val => ! (pendingChannelByNodeID[pubKey] && pendingChannelByNodeID[pubKey][val]))
-                if (where.length)
+            if (command === 'open' && toOpenChannel) {
+                let minimalAmnt = Math.round(item.newCapacity < options.minimalChannel ? options.minimalChannel : item.newCapacity)
+                let data
+                if (nodeAddresses[pubKey]) {
+                    // У неё есть IP address
+                    let where = Object.keys(nodeStorage.nodes).filter(val => ! (pendingBalancesByNodeId[pubKey] && pendingBalancesByNodeId[pubKey][val]))
+                    if (where.length)
+                        data = {
+                            command: 'openChannel',
+                            where: where,
+                            pubKey: pubKey,
+                            address: nodeAddresses[pubKey],
+                            amount: minimalAmnt
+                        }
+                }
+                else if (connectionNodes[pubKey]) {
                     data = {
                         command: 'openChannel',
-                        where: where,
+                        where: connectionNodes[pubKey],
                         pubKey: pubKey,
-                        address: nodeAddresses[pubKey],
+                        address: null,
                         amount: minimalAmnt
                     }
-            }
-            else if (connectionNodes[pubKey]) {
-                data = {
-                    command: 'openChannel',
-                    where: connectionNodes[pubKey],
-                    pubKey: pubKey,
-                    address: null,
-                    amount: minimalAmnt
+                }
+                else {
+                    debug("Хочется открыть канал с нодой %s, но публичного IP4 у неё нет :(", pubKey)
+                }
+
+                if (data) {
+                    if (data.amount > MAX_CHAN_VALUE)
+                        data.amount = MAX_CHAN_VALUE
+                    console.log("Будет открыт канал на нодах %o с remote %s на сумму %d", data.where, data.pubKey, data.amount)
+                    channelCommands.push(data)
                 }
             }
-            else {
-                console.log("Хочется открыть канал с нодой %s, но публичного IP4 у неё нет :(", pubKey)
-            }
+            else if (command === 'close' && toCloseChannel) {
+                // В первую очередь закрываем большие каналы
+                let reduceAmount = options.threshold - item.newCapacity
 
-            if (data) {
-                if (data.amount > MAX_CHAN_VALUE)
-                    data.amount = MAX_CHAN_VALUE
-                debug("Будет открыт канал на нодах %o с remote %s на сумму %d", data.where, data.pubKey, data.amount)
-                channelCommands.push(data)
-
-            }
-        }
-        else if (command === 'close' && toCloseChannel) {
-            // В первую очередь закрываем большие каналы
-            let reduceAmount = options.threshold - item.newCapacity
-
-            debug("Закрытие канала с узлом (%s), opts: %o", pubKey, item)
-            item
-                .closeChallengers
-                .sort((a, b) => b.channel.local_balance - a.channel.local_balance)
-                .reduce(
-                    (acc, val) => {
-                        if (acc > 0 && (maxBTC === undefined || maxBTC > 0)) {
-                            acc        -= +val.channel.capacity
-                            willBeFree += +val.channel.capacity
-                            if (maxBTC !== undefined)
-                                maxBTC -= +val.channel.capacity / 100000000
-                            let data = {
-                                key:     val.key,
-                                command: 'closeChannel',
-                                channel: val.channel
+                debug("Закрытие канала с узлом (%s), opts: %o", pubKey, item)
+                item
+                    .closeChallengers
+                    .sort((a, b) => b.channel.local_balance - a.channel.local_balance)
+                    .reduce(
+                        (acc, val) => {
+                            if (acc > 0 && (maxBTC === undefined || maxBTC > 0)) {
+                                acc        -= +val.channel.capacity
+                                willBeFree += +val.channel.capacity
+                                if (maxBTC !== undefined)
+                                    maxBTC -= +val.channel.capacity / 100000000
+                                let data = {
+                                    key:     val.key,
+                                    command: 'closeChannel',
+                                    channel: val.channel
+                                }
+                                debug("Будет закрытие канала, команда: %o", data)
+                                channelCommands.push(data)
                             }
-                            debug("Будет закрытие канала, команда: %o", data)
-                            channelCommands.push(data)
-                        }
-                        return acc
-                    },
-                    reduceAmount
-                )
+                            return acc
+                        },
+                        reduceAmount
+                    )
+            }
         }
     }
 
@@ -319,16 +344,20 @@ function* commandChannelPromise() {
 
     for (let item of channelCommands) {
         debug("Команда для канала %o", item)
-        if (options.dryRun)
+        if (options.dryRun) {
             yield Promise.resolve(1)
-        else
-            yield makeCommandForChannel(item)
+        }
+        else {
+            let commandPromise = makeCommandForChannel(item)
+            debug("makeCommandForChannel возвращает promise через yield")
+            yield commandPromise
+        }
     }
 }
 
 async function openNewChannels() {
     // The number of promises to process simultaneously.
-    let concurrency = 100
+    let concurrency = 10
 
     // Create a pool.
     let pool = new PromisePool(commandChannelPromise(), concurrency)
@@ -339,7 +368,7 @@ async function openNewChannels() {
         // - data:
         //   - promise: the Promise that got fulfilled
         //   - result:  the result of that Promise
-        //console.log('update policy: result: %o', event.data.result)
+        debug('fulfilled result: %o', event.data.result)
     })
 
     pool.addEventListener('rejected', function (event) {
@@ -357,62 +386,78 @@ async function openNewChannels() {
     let poolPromise = pool.start()
 
     // Wait for the pool to settle.
-    await poolPromise
-    console.log('Всё завершено успешно')
+    try {
+        await poolPromise
+        console.log('Всё завершено успешно')
+    }
+    catch (e) {
+        console.log('Встретилась ошибка - прервано: %s', e.message)
+    }
 }
 
 async function makeCommandForChannel(command) {
-    if (command.command === 'openChannel')
-        openChannelCommand(command)
-    else if (command.command === 'closeChannel')
-        closeChannelCommand(command)
+    if (command.command === 'openChannel') {
+        debug("makeCommandForChannel openChannel запуск")
+        let res = await openChannelCommand(command)
+        debug("makeCommandForChannel openChannel завершение, res=%o", res)
+        return res
+    }
+    else if (command.command === 'closeChannel') {
+        debug("makeCommandForChannel closeChannel запуск")
+        let {hash, index} = splitChannelPoint(command.channel.channel_point)
+        let res = await closeChannelCommand({hash, index, key: command.key}, !!options.forced)
+        debug("makeCommandForChannel closeChannel завершение, res=%o", res)
+        return res
+    }
+    else if (command.command === 'closeBadChannel') {
+        debug("makeCommandForChannel closeBadChannel запуск")
+        let res = await closeChannelCommand(command, true)
+        debug("makeCommandForChannel closeBadChannel завершение, res=%o", res)
+        return res
+    }
 }
 
-async function closeChannelCommand({key, channel}) {
-    let channelPoint = /^(.*):(\d+)$/.exec(channel.channel_point)
-    if (! channelPoint)
-        throw new Error('channelPoint is not defined (%o)', channel)
-
-    console.log('Закрываем канал (@%s) %s', key, channel.channel_point)
+async function closeChannelCommand({hash, index, key}, forced = false) {
+    console.log('Закрываем канал (@%s) %s:%d', key, hash, index)
     let data = {
         channel_point: {
-            funding_txid_str: channelPoint[1],
-            funding_txid: 'funding_txid_str',
-            output_index:     Number(channelPoint[2])
+            funding_txid_str: hash,
+            funding_txid:     'funding_txid_str',
+            output_index:     index
         },
-        force: ! ! options.forced
+        force: forced
     }
-    if (! options.forced)
-        data.target_conf = 36
-    debug('Закрытие канана: item: %o, data: %o', channel, data)
+    if (! forced)
+        data.target_conf = 24
 
     if (! options.dryRun) {
-        return new Promise((resolve, reject) => {
-            let stream = nodeStorage.nodes[key].client.closeChannel(data)
-            stream.on('data', data => {
-                debug("data of channel %o: %o", channel, data)
-                if (data.update === 'close_pending' || data.update === 'chan_close') {
-                    debug('Вызов cancel, %o', channel)
-                    stream.cancel()
-                }
-            })
-            stream.on('end', () => {
-                debug("end event, resolve %s", resolve ? resolve.name : 'is null')
-                if (resolve)
-                    resolve(3)
-            })
-            stream.on('error', (e) => {
-                debug('error event, error = %o', e)
-                if (e.code === grpc.status.CANCELLED) {
-                    debug('error: canceled')
-                    resolve(2)
-                }
-                else {
-                    reject(e)
-                }
-
-            })
-        })
+        return pTimeout(
+            new Promise((resolve) => {
+                let stream = nodeStorage.nodes[key].client.closeChannel(data)
+                stream.on('data', data => {
+                    debug("data (%s) of channel %s:%d", data.update, hash, index)
+                    if (data.update === 'close_pending' || data.update === 'chan_close') {
+                        stream.cancel()
+                    }
+                })
+                stream.on('end', () => {
+                    debug("end event (%s:%d), resolve %s", hash, index, resolve ? resolve.name : 'is null')
+                    if (resolve)
+                        resolve(3)
+                })
+                stream.on('error', (e) => {
+                    if (e.code === grpc.status.CANCELLED) {
+                        debug("Всё OK - канал закрывается по canceled %s:%d", hash, index)
+                        resolve(2)
+                    }
+                    else {
+                        debug("Встретилась ошибка (%s), но мы не прерываем процесс, чтобы обработать другие каналы %s:%d", e.message, hash, index)
+                        resolve(4)
+                    }
+                })
+            }),
+            OPEN_CHANNEL_TIMEOUT
+        ).catch( () => {} ) // Делаем promise всегда без ошибок - чтобы продолжалась работа пула
     }
     else
         console.log("Псевдозакрытие канала, %o", data)
@@ -427,14 +472,14 @@ async function openChannelCommand({pubKey, where, address, amount}) {
             let connected = false
             try {
                 if (address) {
-                    console.log("Коннект (%s) на ноду (%s @ %s) для открытия канала", address, pubKey, whereOpen)
+                    debug("Коннект (%s) на ноду (%s @ %s) для открытия канала", address, pubKey, whereOpen)
                     let connect_res = await myNode.client.connectPeer({addr: {pubkey: pubKey, host: address}, perm: false})
                     debug("openChannelWithNodes(%s): результат коннекта канала: %o", pubKey, connect_res)
                     connected = true
                 }
                 else {
                     // address === null: там уже есть коннект с нодой whereOpen, а публичного адреса нет
-                    console.log("На ноду %s не коннектимся, так как публичного IP у неё нет, но у нас с ней есть коннект на %s", pubKey, whereOpen)
+                    debug("На ноду %s не коннектимся, так как публичного IP у неё нет, но у нас с ней есть коннект на %s", pubKey, whereOpen)
                     connected = true
                 }
             }
@@ -442,7 +487,7 @@ async function openChannelCommand({pubKey, where, address, amount}) {
 
                 if (/already connected to peer/.test(e.message))
                     connected = true
-                console.log("openChannelWithNodes(%s): коннект (%s) НЕУДАЧЕН (%s) - %s...", pubKey, address, e.message, connected ? 'уже подключены - попробуем создать канал' : 'игнорируем эту ноду')
+                debug("openChannelWithNodes(%s): коннект (%s) НЕУДАЧЕН (%s) - %s...", pubKey, address, e.message, connected ? 'уже подключены - попробуем создать канал' : 'игнорируем эту ноду')
                 if (/connection timed out/.test(e.message))
                     return null
                 if (/connection refused/.test(e.message))
@@ -459,16 +504,16 @@ async function openChannelCommand({pubKey, where, address, amount}) {
                             node_pubkey_string: pubKey,
                             local_funding_amount: amount,
                             push_sat: 0,
-                            target_conf: 24,
+                            target_conf: 12,
                             private: false,
                             min_htlc_msat: 1,
-                            min_confs: 0,
-                            spend_unconfirmed: true
+                            min_confs: 1,
+                            spend_unconfirmed: false
                         }),
                         OPEN_CHANNEL_TIMEOUT
                     )
                     debug("openChannelWithNodes(%s): результат открытия канала: %o", pubKey, res)
-                    console.log("Канал (%s <--> %s / %d sats) успешно открыт!", whereOpen, pubKey, amount)
+                    console.log("OPENED (%s <--> %s / %d sats)", whereOpen, pubKey, amount)
                     return res
                 }
                 catch (e) {
@@ -488,7 +533,7 @@ async function openChannelCommand({pubKey, where, address, amount}) {
 
                     if (minReq) {
                         // Удалённый узел требует минимального размера канала - пробуем удовлетворить его просьбу
-                        console.log("Удалённый узел требует минимального размера канала (%d BTC) - пробуем удовлетворить его просьбу", amount / 100000000)
+                        debug("Удалённый узел требует минимального размера канала (%d BTC) - пробуем удовлетворить его просьбу", amount / 100000000)
                         if (amount > MAX_CHAN_VALUE)
                             amount = MAX_CHAN_VALUE
                         try {
@@ -498,20 +543,20 @@ async function openChannelCommand({pubKey, where, address, amount}) {
                                     node_pubkey_string: pubKey,
                                     local_funding_amount: amount,
                                     push_sat: 0,
-                                    target_conf: 24,
+                                    target_conf: 12,
                                     private: false,
                                     min_htlc_msat: 1,
-                                    min_confs: 0,
-                                    spend_unconfirmed: true
+                                    min_confs: 1,
+                                    spend_unconfirmed: false
                                 }),
                                 OPEN_CHANNEL_TIMEOUT
                             )
                             debug("openChannelWithNodes(%s): результат открытия канала: %o", pubKey, res)
-                            console.log("Канал (%s <--> %s / %d sats) успешно открыт!", whereOpen, pubKey, amount)
+                            console.log("OPENED (%s <--> %s / %d sats)", whereOpen, pubKey, amount)
                             return res
                         }
                         catch (e) {
-                            console.log("openChannelWithNodes(%s): ошибка (%s) открытия канала (коннект есть), возможно кончились средства (%s)", pubKey, e.message, whereOpen)
+                            debug("openChannelWithNodes(%s): ошибка (%s) открытия канала (коннект есть), возможно кончились средства (%s)", pubKey, e.message, whereOpen)
                             continue
                         }
                     }
@@ -529,34 +574,34 @@ async function openChannelCommand({pubKey, where, address, amount}) {
                                         node_pubkey_string: pubKey,
                                         local_funding_amount: amount,
                                         push_sat: 0,
-                                        target_conf: 24,
+                                        target_conf: 12,
                                         private: false,
                                         min_htlc_msat: 1,
-                                        min_confs: 0,
-                                        spend_unconfirmed: true
+                                        min_confs: 1,
+                                        spend_unconfirmed: false
                                     }),
                                     OPEN_CHANNEL_TIMEOUT
                                 )
                                 debug("openChannelWithNodes(%s): результат открытия канала: %o", pubKey, res)
-                                console.log("Канал (%s <--> %s / %d sats) успешно открыт!", whereOpen, pubKey, amount)
+                                console.log("OPENED (%s <--> %s / %d sats)", whereOpen, pubKey, amount)
                                 return res
                             }
                             catch (e) {
-                                console.log("openChannelWithNodes(%s): ошибка (%s) открытия канала (коннект есть), возможно кончились средства (%s)", pubKey, e.message, whereOpen)
+                                debug("openChannelWithNodes(%s): ошибка (%s) открытия канала (коннект есть), возможно кончились средства (%s)", pubKey, e.message, whereOpen)
                                 continue
                             }
                         }
                         else {
-                            console.log("Мы имеем коннект с узлом (%s <--> %s), который не имеет публичного IP, но не можем открыть канал - недостаточно средств (%d sats) для минимума канала", pubKey, whereOpen, amount)
+                            debug("Мы имеем коннект с узлом (%s <--> %s), который не имеет публичного IP, но не можем открыть канал - недостаточно средств (%d sats) для минимума канала", pubKey, whereOpen, amount)
                         }
                     }
                     else {
                         if (/Multiple channels unsupported/.test(e.message)) {
                             // Достаточно продолжить открытие на другом узле
-                            console.log("Узел %s не поддерживает несколько каналов с одной нодой (%s) - пробуем дальше", pubKey, whereOpen)
+                            debug("Узел %s не поддерживает несколько каналов с одной нодой (%s) - пробуем дальше", pubKey, whereOpen)
                         }
                         else {
-                            console.log("openChannelWithNodes(%s): ошибка (%s) открытия канала (коннект есть), возможно кончились средства (%s)", pubKey, e.message, whereOpen)
+                            debug("openChannelWithNodes(%s): ошибка (%s) открытия канала (коннект есть), возможно кончились средства (%s)", pubKey, e.message, whereOpen)
                         }
                     }
                     continue
@@ -567,7 +612,7 @@ async function openChannelCommand({pubKey, where, address, amount}) {
             }
         }
         catch (e) {
-            console.log("Пойманная ошибка openChannelWithNodes(%s) @ %s: %o", pubKey, myNode.key, e)
+            debug("Пойманная ошибка openChannelWithNodes(%s) @ %s: %o", pubKey, myNode.key, e)
             throw Error(`Ошибка openChannelWithNodes(${pubKey}): ${e.message}, ${e.stack}`)
         }
     }
@@ -588,7 +633,7 @@ function defineAddresses(describeGraph) {
 function defineConnectionNodes(key, listPeers) {
     for(let peer of listPeers.peers) {
         if (! nodeAddresses.hasOwnProperty(peer.pub_key)) {
-            console.log("Узел %s не имеет публичного IP, но он имеет коннект на %s - будем в том числе там создавать канал", peer.pub_key, key)
+            debug("Узел %s не имеет публичного IP, но он имеет коннект на %s - будем в том числе там создавать канал", peer.pub_key, key)
             connectionNodes[peer.pub_key] = connectionNodes[peer.pub_key] || []
             connectionNodes[peer.pub_key].push(key)
         }

@@ -1,4 +1,4 @@
-create database `lnbig-test` character set 'utf8';
-GRANT ALL ON `lnbig-test`.* TO 'lnbig-test'@'localhost' IDENTIFIED BY '___PASSWORD___';
-use `lnbig-test`;
-
+CREATE DATABASE `lnbig-test` CHARACTER SET 'utf8';
+CREATE USER 'lnbig-test'@'localhost' IDENTIFIED BY '__PASSWORD__';
+GRANT ALL ON `lnbig-test`.* TO 'lnbig-test'@'localhost';
+USE `lnbig-test`;

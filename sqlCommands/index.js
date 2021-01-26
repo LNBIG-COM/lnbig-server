@@ -8,7 +8,7 @@ require('dotenv').config()
 
 let describeGraph = require('../lib/describeGraph')
 
-process.umask(077);
+process.umask(0o77);
 
 const nodeStorage = require('../global/nodeStorage');
 

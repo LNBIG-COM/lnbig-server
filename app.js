@@ -7,9 +7,10 @@
 require('dotenv').config()
 process.umask(0o77);
 
-const nodeStorage = require('./global/nodeStorage');
-const chat = require('./global/chat');
-const clientStorage = require('./global/clientStorage');
+const nodeStorage = require('./global/nodeStorage')
+const billingNode = require('./global/billingNode')
+const chat = require('./global/chat')
+const clientStorage = require('./global/clientStorage')
 
 const Koa = require('koa');
 const Router = require('koa-router');
@@ -29,10 +30,13 @@ if (!process.env.BASE_STORAGE_DIR)
 // Websocket router
 require('./routes/WebSocket')(wsRouter, '/ws')
 
-// шаг 1 - GET запрос для фомирования JSON структуры для открытия канала
-require('./routes/GetLNURL')(httpRouter, '/lnurl');
+// GET запрос callback для забирания средств, которые причитаются за что либо
+require('./routes/LnurlWithdraw')(httpRouter, '/lnurl-withdraw');
 
-// шаг 1 - GET запрос callback для открытия канала
+// GET запрос для фомирования JSON структуры для открытия канала
+require('./routes/GetLnurl')(httpRouter, '/lnurl');
+
+// GET запрос callback для открытия канала
 require('./routes/OpenChannel')(httpRouter, '/oc');
 
 // шаг 2 - получаем 33-байтный nodeid, проверяем его по нодам на лимиты и после либо создаём, либо отказываем
@@ -66,9 +70,11 @@ async function startServer(password) {
 
     // load node storage data included crypted macaroon files, and decrypt macaroon files by password. After the password to be cleaned from memory
     await nodeStorage.init(require('./global/nodesInfo'), password);
+    await billingNode.init(password);
 
     // To connect to nodes
     await nodeStorage.connect()
+    await billingNode.connect()
     await clientStorage.init()
     await chat.load()
 

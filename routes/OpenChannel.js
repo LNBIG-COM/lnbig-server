@@ -1,12 +1,7 @@
-/*
- * Copyright (c) 2019 LNBIG.com
- * All rights reserved.
- */
-
 const openChannelService = require('../global/openChannelService');
 const debug = require('debug')('lnbig:routes:open-channel')
 
-// Это второй шаг, который дёргается клиентом, например BLW, после того, как сделан коннект на ноду, выданную на первом шаге (./GetLNURL)
+// Это второй шаг, который дёргается клиентом, например BLW, после того, как сделан коннект на ноду, выданную на первом шаге (./GetLnurl)
 module.exports = function (router, uri) {
     router.get(
         uri,
@@ -30,10 +25,12 @@ module.exports = function (router, uri) {
 
                 // private - 1 или 0
                 let privateChannel = ctx.query.private
-                if (! /^1|0$/i.test(privateChannel)) {
-                    throw new Error('The private should be 1 or 0')
+                if (privateChannel && /^1|0$/i.test(privateChannel)) {
+                    privateChannel = privateChannel == 1
                 }
-                privateChannel = privateChannel == 1
+                else {
+                    privateChannel = null
+                }
 
                 try {
                     debug("Все поля корректны, проверяем и открываем канал (%s, %s, %s)", uuid, remoteID, privateChannel)

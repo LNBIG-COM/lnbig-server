@@ -11,7 +11,7 @@ program
     .version('0.1.0')
     .option('-n, --dry-run', 'Проверочный запуск без действий')
     .option('-f, --forced', 'Работать с каналами, которые закрыть можно только как forced')
-    .option('-o, --older-days <n>', 'Скольки старее дней должны быть каналы', str => parseInt(str), 60)
+    .option('-o, --older-days <n>', 'Скольки старее дней должны быть каналы', (str, def) => parseInt(str || def, 10), 60)
     .option('-m, --max-btc <n>', 'Скольки максимум освободить BTC', parseFloat)
     .parse(process.argv);
 
