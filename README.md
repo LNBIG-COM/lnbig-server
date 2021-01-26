@@ -5,7 +5,7 @@ This is the source code of the LNBIG project **as it is**. There are no
 guarantees! These are snapshots of two versions (separated by git
 branches) of the project:
 
-1. `master` - The current server part for the [LNBIG.com](lnbig.com)
+1. `master` - The current server part for the [LNBIG.com](https://lnbig.com/)
    server part
 2. `new_open_channel` - the server part for utilities and regular
    actions to maintain the network: its own autopilot for opening
@@ -73,4 +73,4 @@ To see LICENSE file
 Author
 ------
 
-Anonymous developer of the LNBIG project ([LNBIG.com](lnbig.com) site)
+Anonymous developer of the LNBIG project ([LNBIG.com](https://lnbig.com/) site)
